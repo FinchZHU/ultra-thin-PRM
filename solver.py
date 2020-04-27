@@ -1,7 +1,7 @@
 
 from losses import multilabel_soft_margin_loss
 from model import fc_resnet50, finetune
-from prm.prm import peak_response_mapping, prm_visualize
+from prm.prm import peak_response_mapping, prm_visualize, prm_visualize_human_only
 from optims import sgd_optimizer
 import shutil
 import time, os
@@ -10,15 +10,24 @@ import numpy as np
 from typing import Tuple, List, Union, Dict, Iterable
 from torch.autograd import Variable
 import matplotlib.pyplot as plt
-from scipy.misc import imresize
+# from scipy.misc import imresize
+from PIL import Image
+
+VOC_CLASS_NAMES = [
+        'aeroplane', 'bicycle', 'bird', 'boat',
+        'bottle', 'bus', 'car', 'cat', 'chair',
+        'cow', 'diningtable', 'dog', 'horse',
+        'motorbike', 'person', 'pottedplant',
+        'sheep', 'sofa', 'train', 'tvmonitor']
+
 
 image_size = 448
 
 class Solver(object):
 
-    def __init__(self, config):
+    def __init__(self, config, epoch=-1):
         """Initialize configurations."""
-        self.basebone = fc_resnet50(20, True)
+        self.basebone = fc_resnet50(len(config['data_loaders']['dataset'].classes), True)
         self.model = peak_response_mapping(self.basebone, **config['model'])
         self.criterion = multilabel_soft_margin_loss
 
@@ -31,7 +40,8 @@ class Solver(object):
         self.lr_update_step = 999999
         self.lr = config['optimizer']['lr']
         self.snapshot = config['snapshot']
-
+        if (epoch >= 0):
+            self.restore_model(epoch)
         if self.cuda:
             self.model.to('cuda')
 
@@ -44,10 +54,14 @@ class Solver(object):
         print(name)
         print("The number of parameters: {}".format(num_params))
 
-    def restore_model(self, resume_epoch):
+    def restore_model(self, resume_epoch=-1):
         """Restore the trained generator and discriminator."""
-        print('Loading the trained models from step %d ...' % (resume_epoch))
-        model_path = os.path.join(self.snapshot, 'prm__%d_checkpoint.pth.tar' % (resume_epoch))
+        if (resume_epoch >= 0):
+            print('Loading the trained models from step %d ...' % (resume_epoch))
+            model_path = os.path.join(self.snapshot, 'prm__%d_checkpoint.pth.tar' % (resume_epoch))
+        else:
+            print("Loading the latest model...")
+            model_path = os.path.join(self.snapshot, 'prm__latest.pth.tar')
 
         checkpoint = torch.load(model_path)
         start_epoch = checkpoint['epoch']
@@ -64,12 +78,14 @@ class Solver(object):
         return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
     def save_checkpoint(self,state,  path, prefix,epoch, filename='checkpoint.pth.tar'):
+        if (not os.path.isdir(path)):
+            os.mkdir(path)
         prefix_save = os.path.join(path, prefix)
         name = '%s_%d_%s' % (prefix_save,epoch,filename)
         torch.save(state, name)
         shutil.copyfile(name,  '%s_latest.pth.tar' % (prefix_save))
 
-    def train(self, train_data_loader, train_logger, val_data_loader = None, val_logger = None,resume_iters=0 ):
+    def train(self, train_data_loader, train_logger, val_data_loader = None, val_logger = None,resume_iters=0):
 
         # torch.manual_seed(999)
 
@@ -88,7 +104,8 @@ class Solver(object):
         for epoch in range(self.max_epoch):
             average_loss = 0.
             for iteration, (inp, tar) in enumerate(train_data_loader):
-
+                tar = torch.unsqueeze(torch.tensor(tar), axis=1)
+                # print(tar.shape)
                 if iteration % 50 == 0:
                     print(self.basebone.features[0].weight[0][0][0])
                 if self.cuda:
@@ -102,8 +119,8 @@ class Solver(object):
 
                 loss = self.criterion(_output ,tar, difficult_samples=True)
 
-                average_loss += loss.data[0]
-                print('trainning loss at (epoch %d, iteration %d) = %4f' % (epoch + 1, iteration, average_loss/(iteration+1)))
+                average_loss += loss.data
+                print('training loss at (epoch %d, iteration %d) = %4f' % (epoch + 1, iteration, average_loss/(iteration+1)))
 
                 self.optimizer.zero_grad()
                 loss.backward()
@@ -130,31 +147,21 @@ class Solver(object):
         print('train phrase completed in %.0fm %.0fs'% (time_elapsed // 60, time_elapsed % 60))
     
 
-    def inference(self,  input_var, raw_img, epoch=0, proposals=None):
+    def inference(self,  input_var, raw_img, epoch=-1, proposals=[], class_names=VOC_CLASS_NAMES, verbose=True):
         self.restore_model(epoch)
 
         plt.figure(figsize=(5,5))
         plt.imshow(raw_img)
-
-        self.model.eval()
         
-        # print(input_var)
-
-        class_names = [
-        'aeroplane', 'bicycle', 'bird', 'boat',
-        'bottle', 'bus', 'car', 'cat', 'chair',
-        'cow', 'diningtable', 'dog', 'horse',
-        'motorbike', 'person', 'pottedplant',
-        'sheep', 'sofa', 'train', 'tvmonitor']
-        print('Object categories: ' + ', '.join(class_names))
-
-        print('Object categories in the image:')
-
         confidence = self.model(input_var)
+        
+        if (verbose):
+            # print('Object categories: ' + ', '.join(class_names))
+            print('Object categories in the image:')
 
-        for idx in range(len(class_names)):
-            if confidence.data[0, idx] > 0:
-                print('[class_idx: %d] %s (%.2f)' % (idx, class_names[idx], confidence[0, idx]))
+            for idx in range(len(class_names)):
+                if confidence.data[0, idx] > 0:
+                    print('[class_idx: %d] %s (%.2f)' % (idx, class_names[idx], confidence[0, idx]))
 
 
         # Visual cue extraction
@@ -170,41 +177,58 @@ class Solver(object):
             _, class_idx = torch.max(confidence, dim=1)
             class_idx = class_idx.item()
             num_plots = 2 + len(peak_response_maps)
-            print(num_plots, ' numplots')
             f, axarr = plt.subplots(1, num_plots, figsize=(num_plots * 4, 4))
-            axarr[0].imshow(imresize(raw_img, (image_size, image_size), interp='bicubic'))
-            axarr[0].set_title('Image')
-            axarr[0].axis('off')
-            axarr[1].imshow(class_response_maps[0, class_idx].cpu(), interpolation='bicubic')
-            axarr[1].set_title('Class Response Map ("%s")' % class_names[class_idx])
-            axarr[1].axis('off')
-            for idx, (prm, peak) in enumerate(sorted(zip(peak_response_maps, class_peak_responses), key=lambda v: v[-1][-1])):
-                axarr[idx + 2].imshow(prm.cpu(), cmap=plt.cm.jet)
-                axarr[idx + 2].set_title('Peak Response Map ("%s")' % (class_names[peak[1].item()]))
-                axarr[idx + 2].axis('off')
+
+            if verbose:
+                print(num_plots, ' numplots')
+                # axarr[0].imshow(imresize(raw_img, (image_size, image_size), interp='bicubic'))
+                axarr[0].imshow(np.array(raw_img.resize((image_size, image_size), Image.BICUBIC)))
+
+                axarr[0].set_title('Image')
+                axarr[0].axis('off')
+                axarr[1].imshow(class_response_maps[0, class_idx].cpu(), interpolation='bicubic')
+                axarr[1].set_title('Class Response Map ("%s")' % class_names[class_idx])
+                axarr[1].axis('off')
+                for idx, (prm, peak) in enumerate(sorted(zip(peak_response_maps, class_peak_responses), key=lambda v: v[-1][-1])):
+                    axarr[idx + 2].imshow(prm.cpu(), cmap=plt.cm.jet)
+                    axarr[idx + 2].set_title('Peak Response Map ("%s")' % (class_names[peak[1].item()]))
+                    axarr[idx + 2].axis('off')
+
+                axarr[0].imshow(np.array(raw_img.resize((image_size, image_size), Image.BICUBIC)))
+                axarr[0].set_title('Image')
+                axarr[0].axis('off')
+            
+                
+                plt.show()
         
         # Weakly supervised instance segmentation
         # predict instance masks via proposal retrieval
         instance_list = self.model(input_var, retrieval_cfg=dict(proposals=proposals, param=(0.95, 1e-5, 0.8)))
 
+
         # visualization
         if instance_list is None:
             print('No object detected')
+            return None
         else:
             # peak response maps are merged if they select similar proposals
-            vis = prm_visualize(instance_list, class_names=class_names)
-            f, axarr = plt.subplots(1, 3, figsize=(12, 5))
-            axarr[0].imshow(imresize(raw_img, (image_size, image_size), interp='bicubic'))
-            axarr[0].set_title('Image')
-            axarr[0].axis('off')
-            axarr[1].imshow(vis[0])
-            axarr[1].set_title('Prediction')
-            axarr[1].axis('off')
-            axarr[2].imshow(vis[1])
-            axarr[2].set_title('Peak Response Maps')
-            axarr[2].axis('off')
-            plt.show()
+            vis = prm_visualize_human_only(instance_list, class_names=class_names)
+            # vis = prm_visualize(instance_list, class_names=class_names)
+            if verbose:
+                f, axarr = plt.subplots(1, 3, figsize=(12, 5))
+                # axarr[0].imshow(imresize(raw_img, (image_size, image_size), interp='bicubic'))
+                axarr[0].imshow(np.array(raw_img.resize((image_size, image_size), Image.BICUBIC)))
+                axarr[0].set_title('Image')
+                axarr[0].axis('off')
+                axarr[1].imshow(vis[0])
+                axarr[1].set_title('Prediction')
+                axarr[1].axis('off')
+                axarr[2].imshow(vis[1])
+                axarr[2].set_title('Peak Response Maps')
+                axarr[2].axis('off')
+                plt.show()
 
+            return vis[0]
 
     def validation(self, data_loader,test_logger,inference_epoch=0):
         # to-do
