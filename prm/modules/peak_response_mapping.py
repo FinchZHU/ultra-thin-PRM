@@ -5,7 +5,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-from scipy.misc import imresize
+# from scipy.misc import imresize
+from PIL import Image
 
 from ..functions import pr_conv2d, peak_stimulation
 
@@ -135,8 +136,12 @@ class PeakResponseMapping(nn.Sequential):
                 bg_threshold_factor, penalty_factor, balance_factor = param[class_idx]
             else:
                 raise TypeError('Invalid hyper-params "%s".' % param)
-            
-            class_response = imresize(class_response_maps[class_idx], (img_height, img_width), interp='bicubic')
+
+            # class_response = imresize(class_response_maps[class_idx], (img_height, img_width), interp='bicubic')
+            if (len(class_response_maps.shape) == 3):
+                class_response = np.array(Image.fromarray(class_response_maps[class_idx]).resize((img_height, img_width), Image.BICUBIC))
+            elif (len(class_response_maps.shape) == 2):
+                class_response = np.array(Image.fromarray(class_response_maps).resize((img_height, img_width), Image.BICUBIC))
             bg_response = (class_response < bg_threshold_factor * class_response.mean()).astype(np.float32)
             peak_response_map = peak_response_maps[i]
 
@@ -145,9 +150,12 @@ class PeakResponseMapping(nn.Sequential):
             instance_mask = None
 
             for j in range(min(proposal_count, len(proposals))):
-                raw_mask = imresize(proposals[j].astype(int), peak_response_map.shape, interp='nearest')
+
+                # raw_mask = imresize(proposals[j].astype(int), peak_response_map.shape, interp='nearest')
+                raw_mask = np.array(Image.fromarray(proposals[j].astype(np.uint8)).resize(peak_response_map.shape, Image.NEAREST))
+                
                 # get contour of the proposal
-                contour_mask = cv2.morphologyEx(raw_mask, cv2.MORPH_GRADIENT, np.ones((contour_width, contour_width), np.uint8)).astype(bool)
+                contour_mask = cv2.morphologyEx(np.uint8(raw_mask), cv2.MORPH_GRADIENT, np.ones((contour_width, contour_width), np.uint8)).astype(bool)
                 mask = raw_mask.astype(bool)
                 # metric
                 mask_area = mask.sum()
@@ -174,8 +182,6 @@ class PeakResponseMapping(nn.Sequential):
         assert input.dim() == 4, 'PeakResponseMapping layer only supports batch mode.'
         if self.inferencing:
             input.requires_grad_()
-        
-
 
         # classification network forwarding
         class_response_maps = super(PeakResponseMapping, self).forward(input)
@@ -213,8 +219,10 @@ class PeakResponseMapping(nn.Sequential):
             # peak backpropagation
             grad_output = class_response_maps.new_empty(class_response_maps.size())
             for idx in range(peak_list.size(0)):
+                # print(aggregation[peak_list[idx, 0], peak_list[idx, 1]])
                 if aggregation[peak_list[idx, 0], peak_list[idx, 1]] >= class_threshold:
                     peak_val = class_response_maps[peak_list[idx, 0], peak_list[idx, 1], peak_list[idx, 2], peak_list[idx, 3]]
+                    # print(peak_val)
                     if peak_val > peak_threshold:
                         # print('k ')
                         grad_output.zero_()
@@ -259,4 +267,9 @@ class PeakResponseMapping(nn.Sequential):
         super(PeakResponseMapping, self).train(False)
         self._patch()
         self.inferencing = True
+        return self
+        
+    def uninference(self):
+        super(PeakResponseMapping, self).train(True)
+        self.inferencing = False
         return self
